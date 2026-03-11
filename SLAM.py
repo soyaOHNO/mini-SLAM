@@ -1,10 +1,53 @@
 import cv2
 import numpy as np
 import open3d as o3d
+from scipy.optimize import least_squares
 
 # 特徴量抽出のセットアップ
 orb = cv2.ORB_create(500)
 bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+
+def bundle_adjustment(R, t, pts1, pts2, K, points3D):
+    """
+    2ビューのローカルバンドル調整（Levenberg-Marquardt法）
+    カメラ姿勢(R, t)と3D点群を同時に最適化して再投影誤差を最小化する
+    """
+    # カメラの回転行列を回転ベクトル(3次元)に変換（最適化しやすくするため）
+    rvec, _ = cv2.Rodrigues(R)
+    
+    # 最適化する変数を1つの1次元配列にまとめる: [rvec(3), tvec(3), points3D(N*3)]
+    params = np.hstack((rvec.ravel(), t.ravel(), points3D.T.ravel()))
+
+    def residuals(params):
+        # 1次元配列からパラメータを復元
+        rvec_opt = params[:3]
+        tvec_opt = params[3:6]
+        pts_3d_opt = params[6:].reshape(-1, 3)
+
+        # カメラ1 (1つ前のキーフレーム = 原点) への投影誤差
+        rvec1 = np.zeros(3)
+        tvec1 = np.zeros(3)
+        proj1, _ = cv2.projectPoints(pts_3d_opt, rvec1, tvec1, K, None)
+        error1 = proj1.reshape(-1, 2) - pts1
+
+        # カメラ2 (現在のフレーム) への投影誤差
+        proj2, _ = cv2.projectPoints(pts_3d_opt, rvec_opt, tvec_opt, K, None)
+        error2 = proj2.reshape(-1, 2) - pts2
+
+        # すべてのズレ（誤差）を1次元配列にして返す
+        return np.vstack((error1, error2)).ravel()
+
+    # 最適化の実行！（処理落ちを防ぐため最大計算回数は50回に制限）
+    res = least_squares(residuals, params, method='lm', max_nfev=50)
+
+    # 最適化された綺麗なパラメータを取り出して返す
+    opt_rvec = res.x[:3]
+    opt_tvec = res.x[3:6].reshape(3, 1)
+    opt_R, _ = cv2.Rodrigues(opt_rvec)
+    opt_points3D = res.x[6:].reshape(-1, 3).T
+
+    return opt_R, opt_tvec, opt_points3D
+
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -110,6 +153,9 @@ def main():
             P2 = K @ np.hstack((R, t))
             points4D = cv2.triangulatePoints(P1, P2, pts1_in.T, pts2_in.T)
             points3D = points4D[:3] / points4D[3]
+
+            # ★ ここに追加: バンドル調整でカメラ姿勢と3D点群を極限まで最適化
+            R, t, points3D = bundle_adjustment(R, t, pts1_in, pts2_in, K, points3D)
 
             # =========================================================
             # ★ 追加①：スケールの動的推定（歩幅の計算）
